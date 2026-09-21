@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>QUErico — Pide tu música</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎧</text></svg>">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={theme:{extend:{colors:{bg:'#050505',card:'#101517',primary:'#00ff88',secondary:'#8b5cf6'}}}}</script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<style>
+  *{-webkit-tap-highlight-color:transparent}
+  body{background:#050505;color:#fff;font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif}
+  .glow{box-shadow:0 0 20px rgba(0,255,136,.4)}
+  @keyframes pulse-bar{0%,100%{width:30%}50%{width:85%}}
+  .pulse-bar{animation:pulse-bar 2.4s ease-in-out infinite}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .fade-in{animation:fadeIn .25s ease-out}
+  .btn-press{transition:transform .1s,background-color .15s,border-color .15s}
+  .btn-press:active{transform:scale(.96)}
+  .field{width:100%;background:#101517;border:1px solid rgba(255,255,255,.08);border-radius:.75rem;padding:.75rem 1rem;color:#fff;outline:none;font-size:.95rem}
+  .field:focus{border-color:#00ff88}
+  .field::placeholder{color:rgba(255,255,255,.3)}
+  #toast{position:fixed;left:50%;bottom:1.5rem;transform:translate(-50%,1rem);opacity:0;pointer-events:none;padding:.75rem 1.25rem;border-radius:.75rem;font-size:.875rem;font-weight:600;transition:all .25s;z-index:100;max-width:90vw;text-align:center}
+  #toast.show{opacity:1;transform:translate(-50%,0)}
+  #toast.ok{background:#00ff88;color:#050505}
+  #toast.error{background:#ef4444;color:#fff}
+  ::-webkit-scrollbar{width:10px}
+  ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.1);border-radius:5px}
+  .bpm-pill{font-size:10px;padding:2px 6px;border-radius:6px;background:rgba(139,92,246,.15);color:#a78bfa;font-weight:700}
+  #loader{position:fixed;inset:0;background:#050505;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;transition:opacity .4s}
+  #loader.hide{opacity:0;pointer-events:none}
+  @keyframes logo-pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.08);opacity:.85}}
+  .logo-anim{animation:logo-pulse 1.5s ease-in-out infinite}
+</style>
+</head>
+<body>
+<div id="loader"><div class="logo-anim" style="font-size:80px">🎧</div><div style="margin-top:20px;font-size:32px;font-weight:900">QUE<span style="color:#00ff88">rico</span></div></div>
+<div id="app"></div>
+<div id="toast"></div>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
+<script>
+/* CONFIG */
+const FIREBASE_CONFIG={apiKey:"AIzaSyBeyekzOFeofuIMaxzKL1o23pUJ9M6znr8",authDomain:"querico-ac34e.firebaseapp.com",databaseURL:"https://querico-ac34e-default-rtdb.firebaseio.com",projectId:"querico-ac34e",storageBucket:"querico-ac34e.firebasestorage.app",messagingSenderId:"632978055935",appId:"1:632978055935:web:254828f88f37b40446e2ca"};
+
+/* UTILS */
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uid=()=>Math.random().toString(36).slice(2,10);
+const norm=s=>String(s||'').toLowerCase().trim().replace(/\s+/g,' ');
+const baseUrl=()=>location.href.split('#')[0];
+const guestUrl=id=>baseUrl()+'#/e/'+id;
+const tunebatUrl=(t,a)=>'https://tunebat.com/Search?q='+encodeURIComponent((t+' '+(a||'')).trim());
+const setHTML=(id,h)=>{const e=document.getElementById(id);if(e)e.innerHTML=h};
+let toastTimer;
+function toast(m,k='ok'){const el=document.getElementById('toast');el.textContent=m;el.className='';void el.offsetWidth;el.classList.add('show',k);clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.className='',2800)}
+function extractCode(i){const s=String(i||'').trim();const m=s.match(/#\/e\/([A-Za-z0-9_-]+)/);return m?m[1]:s.replace(/[^A-Za-z0-9_-]/g,'')}
+
+/* LÍMITE DE PETICIONES: 3 AL DÍA */
+const REQ_LIMIT=3,REQ_WINDOW=24*60*60*1000;
+function getReqHistory(evId){try{const l=JSON.parse(localStorage.getItem('qr_requests_'+evId)||'[]');const now=Date.now();return l.filter(t=>now-t<REQ_WINDOW)}catch{return[]}}
+function canUserRequest(evId){return getReqHistory(evId).length<REQ_LIMIT}
+function registerUserRequest(evId){const l=getReqHistory(evId);l.push(Date.now());localStorage.setItem('qr_requests_'+evId,JSON.stringify(l))}
+
+/* VOTOS */
+const votesKey=id=>'qr_votes_'+id;
+function loadVotes(id){try{return JSON.parse(localStorage.getItem(votesKey(id))||'{}')}catch{return{}}}
+function saveVotes(id,o){try{localStorage.setItem(votesKey(id),JSON.stringify(o))}catch{}}
+
+/* MIS EVENTOS */
+const MY_KEY='qr_my_events';
+function getMyEvents(){try{return JSON.parse(localStorage.getItem(MY_KEY))||[]}catch{return[]}}
+function addMyEvent(id,name){const l=getMyEvents().filter(e=>e.id!==id);l.unshift({id,name:name||'Evento'});try{localStorage.setItem(MY_KEY,JSON.stringify(l.slice(0,40)))}catch{}}
+function removeMyEvent(id){const l=getMyEvents().filter(e=>e.id!==id);try{localStorage.setItem(MY_KEY,JSON.stringify(l))}catch{}}
+
+/* FIREBASE */
+let auth=null,db=null,currentUser=null;
+try{if(!firebase.apps.length)firebase.initializeApp(FIREBASE_CONFIG);auth=firebase.auth();db=firebase.database();}catch(e){console.error('Firebase init',e)}
+
+/* BACKEND */
+function watchEvent(id,cb){const r=db.ref('events/'+id);const h=r.on('value',s=>cb(s.val()));return()=>r.off('value',h)}
+async function createEvent(data){const u=auth.currentUser;if(!u)throw new Error('No autenticado');let id=null;for(let i=0;i<6&&!id;i++){const c=uid().slice(0,6);const s=await db.ref('events/'+c).get();if(!s.exists())id=c}if(!id)throw new Error('No se pudo generar código');await db.ref('events/'+id).set({...data,songs:{},createdAt:Date.now(),owner:u.uid});return id}
+async function updateEvent(id,patch){await db.ref('events/'+id).update(patch)}
+async function deleteEventDB(id){await db.ref('events/'+id).remove()}
+async function addSong(id,song){await db.ref('events/'+id+'/songs').push({...song,votes:0,status:'pending',addedAt:Date.now()})}
+async function updateSong(id,sid,patch){await db.ref(`events/${id}/songs/${sid}`).update(patch)}
+async function deleteSong(id,sid){await db.ref(`events/${id}/songs/${sid}`).remove()}
+async function voteSong(id,sid,delta){await db.ref(`events/${id}/songs/${sid}/votes`).transaction(v=>(v||0)+delta)}
+
+/* ESTADO */
+const S={route:{name:'landing',id:null},eventId:null,event:null,loading:false,unlocked:false,pinError:false,authReady:false,myVotes:{},searchResults:null,searching:false,loginError:''};
+let unsubEvent=null,eventLoaded=false;
+function songsArray(ev){if(!ev||!ev.songs)return[];return Object.entries(ev.songs).map(([id,s])=>({id,...s}))}
+
+/* ROUTER */
+function parseHash(){const p=location.hash.replace(/^#\/?/,'').split('/').filter(Boolean);if(p[0]==='dj')return{name:'dj',id:p[1]||null};if(p[0]==='e')return{name:'guest',id:p[1]||null};if(p[0]==='s')return{name:'screen',id:p[1]||null};return{name:'landing',id:null}}
+function route(){
+  const r=parseHash();
+  const changed=r.id!==S.eventId||r.name!==S.route.name;
+  S.route=r;
+  if(changed){
+    if(unsubEvent){unsubEvent();unsubEvent=null}
+    S.eventId=r.id||null;S.event=null;S.loading=!!r.id;S.pinError=false;
+    S.unlocked=r.id?sessionStorage.getItem('qr_unlock_'+r.id)==='1':false;
+    S.myVotes=r.id?loadVotes(r.id):{};
+    S.searchResults=null;S.searching=false;eventLoaded=false;
+    if(r.id){unsubEvent=watchEvent(r.id,data=>{const first=!eventLoaded;S.event=data;S.loading=false;eventLoaded=true;if(first&&data&&r.name==='dj')addMyEvent(r.id,data.name);if(first)render();else updateDynamic()})}
+  }
+  render();
+}
+function navigate(h){location.hash=h}
+
+/* RENDER */
+function render(){
+  const el=document.getElementById('app');
+  const r=S.route;let html;
+  switch(r.name){
+    case 'dj':html=r.id?viewDJ():viewDJPicker();break;
+    case 'guest':html=r.id?viewGuest():viewJoin();break;
+    case 'screen':html=r.id?viewScreen():viewLoading();break;
+    default:html=viewLanding();
+  }
+  el.innerHTML=html;
+  document.title=(r.id&&S.event)?S.event.name+' · QUErico':'QUErico';
+  afterRender();
+  if(S.searchResults)renderSearchResults();
+}
+function updateDynamic(){
+  const r=S.route;
+  if(r.name==='dj'&&r.id&&S.event){setHTML('dj-stats',djStatsHTML());setHTML('dj-pending',djPendingHTML());setHTML('dj-now',djNowHTML());setHTML('dj-queue',djQueueHTML());setHTML('dj-played',djPlayedHTML())}
+  if(r.name==='guest'&&S.event){setHTML('guest-now',guestNowHTML());setHTML('guest-top',guestTopHTML());setHTML('guest-played',guestPlayedHTML());setHTML('request-limit',requestLimitHTML());renderSearchResults()}
+  if(r.name==='screen'&&S.event)setHTML('screen-body',screenBodyHTML());
+}
+function afterRender(){document.querySelectorAll('canvas[data-qr]').forEach(c=>{if(c.dataset.done)return;c.dataset.done='1';const url=c.dataset.qr;const size=parseInt(c.dataset.size||'260');if(typeof QRCode!=='undefined'&&QRCode.toCanvas){QRCode.toCanvas(c,url,{width:size,margin:2,color:{dark:'#000000',light:'#ffffff'},errorCorrectionLevel:'M'},err=>{if(err)qrFallback(c,url,size)})}else qrFallback(c,url,size)})}
+function qrFallback(c,url,size){const img=document.createElement('img');img.src='https://api.qrserver.com/v1/create-qr-code/?size='+size+'x'+size+'&margin=4&ecc=M&bgcolor=ffffff&color=000000&data='+encodeURIComponent(url);img.alt='QR';img.className=c.className;c.replaceWith(img)}
+
+/* COMPONENTES */
+function art(s,cls='w-10 h-10'){if(s.artwork)return `<img src="${esc(s.artwork)}" alt="" loading="lazy" class="${cls} rounded-lg object-cover shrink-0 bg-white/5">`;return `<div class="${cls} rounded-lg bg-gradient-to-br from-primary/20 to-secondary/20 flex items-center justify-center shrink-0 text-primary">♪</div>`}
+const statBox=(l,v,c)=>`<div class="bg-card border border-white/5 rounded-2xl p-3 text-center"><p class="text-2xl font-bold ${c}">${v}</p><p class="text-[10px] uppercase tracking-wider text-white/40 mt-1">${l}</p></div>`;
+function viewLoading(){return `<div class="min-h-screen flex items-center justify-center"><div class="text-center"><div class="w-10 h-10 border-2 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-4"></div><p class="text-white/40 text-sm">Cargando…</p></div></div>`}
+function viewNotFound(){return `<div class="min-h-screen flex items-center justify-center px-6"><div class="text-center max-w-sm"><div class="text-5xl mb-4">🔍</div><h1 class="text-2xl font-bold mb-2">Evento no encontrado</h1><button data-act="nav" data-to="#/" class="btn-press mt-6 px-6 py-3 rounded-xl bg-primary text-black font-bold">Volver</button></div></div>`}
+
+/* VISTAS */
+function viewLanding(){
+  return `<div class="min-h-screen flex flex-col items-center justify-center px-6 py-16"><div class="text-center max-w-2xl w-full">
+    <div class="inline-block px-4 py-1.5 rounded-full border border-primary/30 bg-primary/10 text-primary text-sm mb-8">🎧 El futuro de la noche</div>
+    <h1 class="text-6xl md:text-8xl font-black tracking-tight mb-6">QUE<span class="text-primary">rico</span></h1>
+    <p class="text-lg md:text-xl text-white/60 mb-12">Tus clientes piden canciones escaneando un QR.<br>Tú decides qué suena. La pista vota en vivo.</p>
+    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+      <button data-act="nav" data-to="#/dj" class="btn-press px-8 py-4 rounded-xl bg-primary text-black font-bold text-lg">🎛️ Soy DJ</button>
+      <button data-act="nav" data-to="#/e" class="btn-press px-8 py-4 rounded-xl bg-secondary text-white font-bold text-lg">📱 Soy invitado</button>
+    </div>
+  </div></div>`;
+}
+function viewLogin(){
+  return `<div class="min-h-screen flex items-center justify-center px-6"><div class="w-full max-w-sm">
+    <button data-act="nav" data-to="#/" class="text-sm text-white/50 hover:text-white mb-8">← Inicio</button>
+    <h1 class="text-3xl font-black mb-2">Acceso DJ</h1>
+    <p class="text-white/50 text-sm mb-8">Solo el DJ puede entrar aquí.</p>
+    <form data-form="login" class="space-y-3">
+      <input name="email" type="email" required placeholder="tu@email.com" class="field">
+      <input name="password" type="password" required placeholder="Contraseña" class="field">
+      <button type="submit" class="btn-press w-full py-3.5 rounded-xl bg-primary text-black font-bold">Entrar</button>
+    </form>
+    ${S.loginError?`<p class="text-red-400 text-sm mt-4">${esc(S.loginError)}</p>`:''}
+  </div></div>`;
+}
+function viewDJPicker(){
+  if(!S.authReady)return viewLoading();
+  if(!currentUser)return viewLogin();
+  const mine=getMyEvents();
+  return `<div class="min-h-screen p-6 pb-24"><div class="max-w-3xl mx-auto">
+    <div class="flex justify-between items-center mb-6">
+      <button data-act="nav" data-to="#/" class="text-sm text-white/50 hover:text-white">← Inicio</button>
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-white/40">${esc(currentUser.email||'')}</span>
+        <button data-act="logout" class="text-xs text-white/50 hover:text-red-400">Cerrar sesión</button>
+      </div>
+    </div>
+    <h1 class="text-4xl font-black mb-2">Panel del DJ</h1>
+    <p class="text-white/50 mb-10">Crea un evento nuevo o abre uno que ya tengas.</p>
+    <div class="bg-card border border-white/5 rounded-2xl p-6 mb-8">
+      <h2 class="font-bold text-lg mb-4">🎉 Crear evento</h2>
+      <form data-form="create-event" class="grid sm:grid-cols-2 gap-4">
+        <input name="name" required maxlength="60" placeholder="Nombre del evento *" class="field sm:col-span-2">
+        <input name="place" maxlength="60" placeholder="Lugar" class="field">
+        <input name="djName" maxlength="40" placeholder="DJ" class="field">
+        <input name="cover" type="url" maxlength="300" placeholder="Foto de portada — URL (opcional)" class="field sm:col-span-2">
+        <input name="pin" inputmode="numeric" maxlength="6" placeholder="PIN del panel (opcional)" class="field sm:col-span-2">
+        <button type="submit" class="btn-press sm:col-span-2 py-3.5 rounded-xl bg-primary text-black font-bold">Crear y abrir panel</button>
+      </form>
+      <p class="text-[11px] text-white/30 mt-3">💡 Para la foto, sube una imagen a <span class="text-primary">imgur.com</span> y pega aquí su URL.</p>
+      <form data-form="open" class="flex gap-2 mt-4">
+        <input name="code" placeholder="…o abre uno con su código" class="field flex-1">
+        <button type="submit" class="btn-press px-5 rounded-xl bg-white/5 border border-white/10 text-sm">Abrir</button>
+      </form>
+    </div>
+    ${mine.length?`<h2 class="font-bold text-lg mb-4">Tus eventos</h2><div class="space-y-3">${mine.map(m=>`
+      <div class="bg-card border border-white/5 rounded-2xl p-4 flex items-center gap-3">
+        <button data-act="nav" data-to="#/dj/${esc(m.id)}" class="btn-press flex-1 text-left min-w-0">
+          <span class="font-semibold block truncate">${esc(m.name)}</span>
+          <span class="text-white/30 text-xs font-mono">${esc(m.id)}</span>
+        </button>
+        <button data-act="delete-event" data-id="${esc(m.id)}" data-name="${esc(m.name)}" class="btn-press w-9 h-9 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm shrink-0" title="Borrar">🗑</button>
+      </div>`).join('')}</div>`:''}
+  </div></div>`;
+}
+function viewDJ(){
+  if(!S.authReady)return viewLoading();
+  if(!currentUser)return viewLogin();
+  if(S.loading&&!S.event)return viewLoading();
+  if(!S.event)return viewNotFound();
+  if(S.event.pin&&!S.unlocked)return viewPin();
+  const e=S.event;
+  const url=guestUrl(S.eventId);
+  const meta=[e.place,e.djName,e.date].filter(Boolean).map(esc).join(' · ');
+  const cover=e.cover?`<div class="mb-4 rounded-2xl overflow-hidden h-32 md:h-40 bg-cover bg-center" style="background-image:url('${esc(e.cover)}')"></div>`:'';
+  return `<div class="min-h-screen p-4 md:p-6 pb-24"><div class="max-w-7xl mx-auto">
+    ${cover}
+    <header class="flex items-start justify-between gap-4 mb-8">
+      <div class="min-w-0"><p class="text-[11px] uppercase tracking-[0.2em] text-primary mb-1">Panel del DJ</p><h1 class="text-2xl md:text-3xl font-bold truncate">${esc(e.name)}</h1>${meta?`<p class="text-white/50 text-sm mt-1 truncate">${meta}</p>`:''}</div>
+      <div class="flex gap-2 shrink-0">
+        <button data-act="nav" data-to="#/s/${esc(S.eventId)}" class="btn-press px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-sm">📺 Pantalla</button>
+        <button data-act="nav" data-to="#/dj" class="btn-press px-3 py-2 rounded-xl bg-white/5 border border-white/10 text-sm">Salir</button>
+      </div>
+    </header>
+    <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <aside class="lg:col-span-3 space-y-4">
+        <div class="bg-white rounded-2xl p-5 text-center">
+          <canvas data-qr="${esc(url)}" data-size="280" class="w-full max-w-[280px] mx-auto block"></canvas>
+          <p class="text-black/70 text-[11px] mt-3 font-mono break-all leading-tight">${esc(url.replace(/^https?:\/\//,''))}</p>
+        </div>
+        <div class="bg-card border border-white/5 rounded-2xl p-3 text-xs text-white/60 leading-relaxed">
+          <p class="font-bold text-white mb-1">📱 ¿No escanean el QR?</p>
+          <p>1. Pulsa <b>Compartir enlace</b></p>
+          <p>2. Envíalo por WhatsApp</p>
+          <p>3. O diles el código: <b class="text-primary font-mono">${esc(S.eventId)}</b></p>
+        </div>
+        <button data-act="copy" data-url="${esc(url)}" class="btn-press w-full py-3 rounded-xl bg-white/5 border border-white/10 text-sm">🔗 Copiar enlace</button>
+        <button data-act="share" data-url="${esc(url)}" data-name="${esc(e.name)}" class="btn-press w-full py-3 rounded-xl bg-secondary text-white font-bold text-sm">📤 Compartir enlace</button>
+        <div id="dj-stats">${djStatsHTML()}</div>
+      </aside>
+      <section class="lg:col-span-4">
+        <h2 class="text-[11px] uppercase tracking-[0.2em] text-amber-400 mb-4">⏳ Pendientes</h2>
+        <div id="dj-pending" class="space-y-3">${djPendingHTML()}</div>
+      </section>
+      <section class="lg:col-span-5">
+        <h2 class="text-[11px] uppercase tracking-[0.2em] text-primary mb-4">🔥 Cola en vivo</h2>
+        <div id="dj-now">${djNowHTML()}</div>
+        <div id="dj-queue" class="space-y-3">${djQueueHTML()}</div>
+      </section>
+    </div>
+    <section class="mt-10">
+      <details class="bg-card border border-white/5 rounded-2xl p-5">
+        <summary class="cursor-pointer select-none text-[11px] uppercase tracking-[0.2em] text-white/40 hover:text-white/70">✅ Ya cantadas (historial)</summary>
+        <div id="dj-played" class="mt-4 space-y-2">${djPlayedHTML()}</div>
+      </details>
+    </section>
+    <section class="mt-6 pb-12">
+      <button data-act="delete-event" data-id="${esc(S.eventId)}" data-name="${esc(e.name)}" class="btn-press w-full py-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 font-bold text-sm">🗑 Borrar este evento</button>
+    </section>
+  </div></div>`;
+}
+function viewPin(){
+  return `<div class="min-h-screen flex items-center justify-center px-6"><div class="w-full max-w-sm text-center">
+    <div class="text-5xl mb-6">🔒</div><h1 class="text-2xl font-bold mb-2">${esc(S.event.name)}</h1>
+    <p class="text-white/50 text-sm mb-8">Introduce el PIN del panel.</p>
+    <form data-form="unlock" class="space-y-3">
+      <input name="pin" required inputmode="numeric" maxlength="6" class="field text-center text-2xl tracking-[0.4em] font-mono" placeholder="••••">
+      <button type="submit" class="btn-press w-full py-3.5 rounded-xl bg-primary text-black font-bold">Entrar</button>
+    </form>
+    ${S.pinError?`<p class="text-red-400 text-sm mt-4">PIN incorrecto</p>`:''}
+    <button data-act="nav" data-to="#/dj" class="mt-6 text-xs text-white/40 underline">← Volver</button>
+  </div></div>`;
+}
+function djStatsHTML(){const s=songsArray(S.event);return `<div class="grid grid-cols-3 gap-2">${statBox('Cola',s.filter(x=>x.status==='approved').length,'text-primary')}${statBox('Pend.',s.filter(x=>x.status==='pending').length,'text-amber-400')}${statBox('Cantadas',s.filter(x=>x.status==='played').length,'text-secondary')}</div>`}
+function bpmRow(s){const t=tunebatUrl(s.title,s.artist);return `<div class="flex items-center gap-1.5 mt-2"><span class="bpm-pill">${s.bpm?s.bpm+' BPM':'BPM?'}</span><a href="${t}" target="_blank" rel="noopener" class="text-[10px] text-secondary hover:text-white underline">🔍 Tunebat</a><button data-act="bpm" data-id="${esc(s.id)}" data-title="${esc(s.title)}" class="text-[10px] text-white/40 hover:text-white">✎</button></div>`}
+function djPendingHTML(){const l=songsArray(S.event).filter(s=>s.status==='pending').sort((a,b)=>(a.addedAt||0)-(b.addedAt||0));if(!l.length)return `<p class="text-white/30 text-sm">No hay peticiones nuevas.</p>`;return l.map(s=>`<div class="bg-card border border-white/5 rounded-2xl p-4 fade-in"><div class="flex items-start gap-3 mb-3">${art(s,'w-10 h-10')}<div class="min-w-0 flex-1"><p class="font-semibold truncate">${esc(s.title)}</p><p class="text-sm text-white/50 truncate">${esc(s.artist)}</p></div>${s.votes?`<span class="text-xs font-bold shrink-0 ${s.votes>0?'text-primary':'text-red-400'}">${s.votes>0?'▲':'▼'} ${Math.abs(s.votes)}</span>`:''}</div>${bpmRow(s)}<div class="flex gap-2 mt-3"><button data-act="approve" data-id="${esc(s.id)}" class="btn-press flex-1 py-2 rounded-lg bg-primary text-black font-bold text-sm">✓ Aprobar</button><button data-act="reject" data-id="${esc(s.id)}" class="btn-press px-4 py-2 rounded-lg bg-red-500/15 text-red-400 border border-red-500/30 text-sm">✗</button></div></div>`).join('')}
+function djNowHTML(){const s=songsArray(S.event).find(x=>x.status==='playing');if(!s)return '';return `<div class="mb-4 p-4 rounded-2xl bg-gradient-to-r from-primary/20 to-secondary/20 border border-primary/30 fade-in"><div class="text-[11px] text-primary font-bold tracking-[0.2em] mb-2">🔊 SONANDO AHORA</div><div class="flex items-center gap-3">${art(s,'w-12 h-12')}<div class="min-w-0 flex-1"><p class="font-bold truncate">${esc(s.title)}</p><p class="text-white/60 text-sm truncate">${esc(s.artist)}</p></div><button data-act="stop" data-id="${esc(s.id)}" class="btn-press w-9 h-9 rounded-lg bg-white/10 text-sm shrink-0">■</button></div>${bpmRow(s)}<div class="mt-3 h-1 bg-white/10 rounded-full overflow-hidden"><div class="h-full bg-primary pulse-bar"></div></div></div>`}
+function djQueueHTML(){const l=songsArray(S.event).filter(s=>s.status==='approved').sort((a,b)=>(b.votes||0)-(a.votes||0)||(a.addedAt||0)-(b.addedAt||0));if(!l.length)return `<p class="text-white/30 text-sm">La cola está vacía.</p>`;return l.map((s,i)=>{const vc=(s.votes||0)>0?'text-primary':(s.votes||0)<0?'text-red-400':'text-white/40';return `<div class="bg-card border border-white/5 rounded-2xl p-3 fade-in"><div class="flex items-center gap-3"><span class="text-lg font-mono text-primary/60 w-7 text-center shrink-0">${i+1}</span>${art(s,'w-10 h-10')}<div class="flex-1 min-w-0"><p class="font-semibold truncate">${esc(s.title)}</p><p class="text-xs text-white/50 truncate">${esc(s.artist)}</p></div><div class="text-center shrink-0 px-1"><div class="font-bold leading-tight ${vc}">${s.votes||0}</div><div class="text-[9px] text-white/40 uppercase">votos</div></div><button data-act="play" data-id="${esc(s.id)}" class="btn-press w-9 h-9 rounded-lg bg-secondary text-white text-sm shrink-0">▶</button><button data-act="delete" data-id="${esc(s.id)}" class="btn-press w-9 h-9 rounded-lg bg-white/5 border border-white/10 text-white/50 text-sm shrink-0">🗑</button></div><div class="mt-2 pl-10">${bpmRow(s)}</div></div>`}).join('')}
+function djPlayedHTML(){const l=songsArray(S.event).filter(s=>s.status==='played').sort((a,b)=>(b.playedAt||0)-(a.playedAt||0)).slice(0,15);if(!l.length)return `<p class="text-white/30 text-sm">Aún no has cantado ninguna.</p>`;return l.map(s=>`<div class="flex items-center gap-3 bg-white/5 rounded-xl p-2.5">${art(s,'w-8 h-8')}<div class="flex-1 min-w-0"><p class="text-sm font-semibold truncate">${esc(s.title)}</p><p class="text-xs text-white/40 truncate">${esc(s.artist)}</p></div>${s.bpm?`<span class="bpm-pill">${s.bpm} BPM</span>`:''}<button data-act="replay" data-id="${esc(s.id)}" class="text-[11px] text-primary hover:underline shrink-0">Repetir</button><button data-act="delete" data-id="${esc(s.id)}" class="text-[11px] text-white/30 hover:text-red-400 shrink-0">✕</button></div>`).join('')}
+function viewJoin(){
+  return `<div class="min-h-screen flex items-center justify-center px-6"><div class="w-full max-w-sm text-center">
+    <div style="font-size:60px" class="mb-4">🎧</div>
+    <h1 class="text-4xl font-black mb-3">QUE<span class="text-primary">rico</span></h1>
+    <p class="text-white/50 mb-8 text-sm">Escanea el QR del local o introduce el código.</p>
+    <form data-form="join" class="space-y-3">
+      <input name="code" required placeholder="Código del evento" class="field text-center font-mono">
+      <button type="submit" class="btn-press w-full py-3.5 rounded-xl bg-primary text-black font-bold">Entrar</button>
+    </form>
+    <button data-act="nav" data-to="#/" class="mt-6 text-xs text-white/40 underline">← Volver</button>
+  </div></div>`;
+}
+function viewGuest(){
+  if(S.loading&&!S.event)return viewLoading();
+  if(!S.event)return viewNotFound();
+  const e=S.event;
+  const cover=e.cover?`<div class="rounded-2xl overflow-hidden h-40 mb-4 bg-cover bg-center" style="background-image:url('${esc(e.cover)}')"></div>`:'';
+  return `<div class="min-h-screen max-w-lg mx-auto p-4 pb-28">
+    ${cover}
+    <header class="flex justify-between items-center mb-6 gap-3">
+      <div class="min-w-0"><p class="text-[11px] text-white/40 uppercase tracking-[0.2em]">Estás en</p><h1 class="text-xl font-bold truncate">${esc(e.name)}</h1>${e.place?`<p class="text-xs text-white/40 truncate">${esc(e.place)}</p>`:''}</div>
+      <button data-act="nav" data-to="#/" class="text-xs text-white/40 shrink-0">Salir</button>
+    </header>
+    <div id="guest-now">${guestNowHTML()}</div>
+    <section class="mb-8">
+      <p class="text-[11px] uppercase tracking-[0.2em] text-white/40 mb-3">Pide una canción</p>
+      <div id="request-limit">${requestLimitHTML()}</div>
+      <form data-form="search" class="flex gap-2">
+        <input name="q" required placeholder="Busca título o artista…" class="field flex-1">
+        <button type="submit" class="btn-press px-5 rounded-xl bg-primary text-black font-bold text-sm">Buscar</button>
+      </form>
+      <div id="search-results" class="mt-3 space-y-2"></div>
+      <details class="mt-4">
+        <summary class="text-xs text-white/40 cursor-pointer hover:text-white/70 select-none">¿No lo encuentras? Añádelo a mano o pega un enlace</summary>
+        <form data-form="manual" class="mt-3 grid gap-2">
+          <input name="title" required maxlength="80" placeholder="Título" class="field">
+          <input name="artist" maxlength="80" placeholder="Artista" class="field">
+          <button type="submit" class="btn-press py-2.5 rounded-xl bg-secondary text-white font-bold text-sm">Enviar petición</button>
+        </form>
+        <form data-form="paste" class="mt-3 grid gap-2">
+          <input name="url" required placeholder="Pega enlace de YouTube, Spotify, Apple Music…" class="field">
+          <button type="submit" class="btn-press py-2.5 rounded-xl bg-primary/20 border border-primary/40 text-primary font-bold text-sm">Añadir desde enlace</button>
+        </form>
+      </details>
+    </section>
+    <section class="mb-8">
+      <p class="text-[11px] uppercase tracking-[0.2em] text-white/40 mb-3">🔥 Top de la noche</p>
+      <div id="guest-top" class="space-y-3">${guestTopHTML()}</div>
+    </section>
+    <section>
+      <details class="bg-card border border-white/5 rounded-2xl p-4">
+        <summary class="cursor-pointer select-none text-[11px] uppercase tracking-[0.2em] text-white/40 hover:text-white/70">✅ Ya cantadas</summary>
+        <div id="guest-played" class="mt-3 space-y-2">${guestPlayedHTML()}</div>
+      </details>
+    </section>
+  </div>`;
+}
+function requestLimitHTML(){
+  if(!S.eventId)return '';
+  const used=getReqHistory(S.eventId).length;
+  const remaining=REQ_LIMIT-used;
+  if(remaining>0){
+    return `<div class="mb-3 text-[11px] text-white/40">Te quedan <b class="text-primary">${remaining}</b> peticiones hoy.</div>`;
+  }
+  return `<div class="mb-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs">⏳ Has usado tus <b>${REQ_LIMIT}</b> peticiones de hoy. Podrás pedir más mañana. Mientras tanto, ¡vota las de otros!</div>`;
+}
+function guestNowHTML(){const s=songsArray(S.event).find(x=>x.status==='playing');if(!s)return '';return `<div class="mb-6 p-4 rounded-2xl bg-gradient-to-r from-primary/20 to-secondary/20 border border-primary/30 fade-in"><div class="text-[11px] text-primary font-bold tracking-[0.2em] mb-2">🔊 SONANDO AHORA</div><div class="flex items-center gap-3">${art(s,'w-12 h-12')}<div class="min-w-0"><p class="font-bold truncate">${esc(s.title)}</p><p class="text-white/60 text-sm truncate">${esc(s.artist)}</p></div></div></div>`}
+function voteButtons(s){const my=S.myVotes[s.id];const score=s.votes||0;const upCls=my===1?'bg-primary text-black border-primary':'bg-primary/10 border-primary/30 text-primary';const downCls=my===-1?'bg-red-500 text-white border-red-500':'bg-red-500/10 border-red-500/30 text-red-400';const sc=score>0?'text-primary':score<0?'text-red-400':'text-white/50';return `<div class="flex items-center gap-1 shrink-0"><button data-act="upvote" data-id="${esc(s.id)}" class="btn-press w-8 h-8 rounded-lg border ${upCls} flex items-center justify-center text-xs">▲</button><span class="w-7 text-center font-bold text-sm ${sc}">${score}</span><button data-act="downvote" data-id="${esc(s.id)}" class="btn-press w-8 h-8 rounded-lg border ${downCls} flex items-center justify-center text-xs">▼</button></div>`}
+function guestTopHTML(){const l=songsArray(S.event).filter(s=>s.status==='approved'||s.status==='playing').sort((a,b)=>(b.votes||0)-(a.votes||0)||(a.addedAt||0)-(b.addedAt||0));if(!l.length)return `<p class="text-white/30 text-sm">Todavía no hay canciones. ¡Sé el primero!</p>`;return l.map((s,i)=>{const playing=s.status==='playing';return `<div class="bg-card border ${playing?'border-primary/40':'border-white/5'} rounded-2xl p-3 flex items-center gap-3 fade-in"><span class="font-mono text-white/30 w-6 text-center shrink-0">${i+1}</span>${art(s,'w-10 h-10')}<div class="flex-1 min-w-0"><p class="font-semibold truncate text-sm">${esc(s.title)}</p><p class="text-xs text-white/50 truncate">${esc(s.artist)}</p></div>${voteButtons(s)}</div>`}).join('')}
+function guestPlayedHTML(){const l=songsArray(S.event).filter(s=>s.status==='played').sort((a,b)=>(b.playedAt||0)-(a.playedAt||0)).slice(0,10);if(!l.length)return `<p class="text-white/30 text-sm">Aún no se ha cantado ninguna.</p>`;return l.map(s=>`<div class="flex items-center gap-3 bg-white/5 rounded-xl p-2.5">${art(s,'w-8 h-8')}<div class="flex-1 min-w-0"><p class="text-sm font-semibold truncate">${esc(s.title)}</p><p class="text-xs text-white/40 truncate">${esc(s.artist)}</p></div></div>`).join('')}
+function renderSearchResults(){
+  const el=document.getElementById('search-results');if(!el)return;
+  if(S.searching){el.innerHTML=`<p class="text-white/40 text-sm py-3">Buscando…</p>`;return}
+  if(!S.searchResults){el.innerHTML='';return}
+  if(!S.searchResults.length){el.innerHTML=`<p class="text-white/40 text-sm py-2">Sin resultados. Prueba otro término.</p>`;return}
+  const existing=new Set(songsArray(S.event).filter(s=>['pending','approved','playing'].includes(s.status)).map(s=>norm(s.title)+'|'+norm(s.artist)));
+  const canReq=canUserRequest(S.eventId);
+  el.innerHTML=S.searchResults.map(r=>{const k=norm(r.title)+'|'+norm(r.artist);const already=existing.has(k);return `<div class="bg-card border border-white/5 rounded-xl p-2.5 flex items-center gap-3 fade-in">${r.artwork?`<img src="${esc(r.artwork)}" alt="" loading="lazy" class="w-10 h-10 rounded-lg object-cover shrink-0 bg-white/5">`:`<div class="w-10 h-10 rounded-lg bg-white/5 shrink-0"></div>`}<div class="flex-1 min-w-0"><p class="text-sm font-semibold truncate">${esc(r.title)}</p><p class="text-xs text-white/50 truncate">${esc(r.artist)}</p></div>${already?`<button data-act="request" data-title="${esc(r.title)}" data-artist="${esc(r.artist)}" data-artwork="${esc(r.artwork||'')}" class="btn-press px-3.5 py-2 rounded-lg bg-primary/10 border border-primary/30 text-primary text-xs font-bold shrink-0">👍 Votar</button>`:canReq?`<button data-act="request" data-title="${esc(r.title)}" data-artist="${esc(r.artist)}" data-artwork="${esc(r.artwork||'')}" class="btn-press px-3.5 py-2 rounded-lg bg-primary/10 border border-primary/30 text-primary text-xs font-bold shrink-0">Pedir</button>`:`<span class="text-[11px] text-white/30 shrink-0 px-2">⏳</span>`}</div>`}).join('');
+}
+function viewScreen(){if(S.loading&&!S.event)return viewLoading();if(!S.event)return viewNotFound();const e=S.event;return `<div class="min-h-screen bg-black flex flex-col p-6 md:p-12"><header class="flex items-center justify-between mb-10 md:mb-16 gap-4"><h1 class="text-xl md:text-3xl font-black truncate">${esc(e.name)}</h1><span class="text-white/30 text-xs md:text-base shrink-0">${esc(e.place||'')}</span></header><div id="screen-body" class="flex-1">${screenBodyHTML()}</div></div>`}
+function screenBodyHTML(){const l=songsArray(S.event);const now=l.find(s=>s.status==='playing');const next=l.filter(s=>s.status==='approved').sort((a,b)=>(b.votes||0)-(a.votes||0)).slice(0,5);return `<div class="text-center mb-12 md:mb-20">${now?`<p class="text-primary text-xs md:text-sm tracking-[0.4em] uppercase mb-5">Sonando ahora</p><h2 class="text-4xl md:text-7xl font-black mb-4 leading-tight px-2">${esc(now.title)}</h2><p class="text-xl md:text-4xl text-white/50">${esc(now.artist)}</p>${now.bpm?`<p class="mt-4 text-secondary font-mono">${now.bpm} BPM</p>`:''}`:`<p class="text-white/25 text-2xl md:text-4xl">Esperando la próxima canción…</p>`}</div>${next.length?`<div class="max-w-3xl mx-auto"><p class="text-white/30 text-[10px] md:text-xs tracking-[0.3em] uppercase mb-5 text-center">A continuación</p><div class="space-y-2 md:space-y-3">${next.map((s,i)=>`<div class="flex items-center gap-4 bg-white/5 rounded-2xl px-4 md:px-6 py-3 md:py-4"><span class="text-lg md:text-2xl font-mono text-primary/50 w-8 md:w-10 shrink-0">${i+1}</span><div class="min-w-0 flex-1"><p class="text-base md:text-xl font-bold truncate">${esc(s.title)}</p><p class="text-white/50 text-sm md:text-base truncate">${esc(s.artist)}</p></div>${s.bpm?`<span class="bpm-pill">${s.bpm}</span>`:''}<span class="text-primary font-bold text-lg md:text-2xl shrink-0">${s.votes||0}</span></div>`).join('')}</div></div>`:''}`}
+
+/* BÚSQUEDA multi-método */
+function searchiTunesJSONP(term){return new Promise((resolve,reject)=>{const cb='icb_'+Math.floor(Math.random()*999999);const script=document.createElement('script');let done=false;const timer=setTimeout(()=>{fin(new Error('timeout'))},8000);function fin(err,data){if(done)return;done=true;clearTimeout(timer);try{delete window[cb]}catch(e){}if(script.parentNode)script.parentNode.removeChild(script);err?reject(err):resolve(data)}window[cb]=d=>fin(null,d);script.onerror=()=>fin(new Error('network'));script.src='https://itunes.apple.com/search?media=music&entity=song&limit=25&callback='+cb+'&term='+encodeURIComponent(term);document.body.appendChild(script)})}
+function fetchTimeout(url,ms=8000){return new Promise((resolve,reject)=>{const t=setTimeout(()=>reject(new Error('timeout')),ms);fetch(url).then(r=>{clearTimeout(t);resolve(r)}).catch(e=>{clearTimeout(t);reject(e)})})}
+async function searchAllOrigins(term){const target='https://itunes.apple.com/search?media=music&entity=song&limit=25&term='+encodeURIComponent(term);const url='https://api.allorigins.win/get?url='+encodeURIComponent(target);const res=await fetchTimeout(url);if(!res.ok)throw new Error('allorigins');const json=await res.json();return JSON.parse(json.contents)}
+async function searchCorsProxy(term){const target='https://itunes.apple.com/search?media=music&entity=song&limit=25&term='+encodeURIComponent(term);const url='https://corsproxy.io/?url='+encodeURIComponent(target);const res=await fetchTimeout(url);if(!res.ok)throw new Error('corsproxy');return await res.json()}
+async function searchMusicBrainz(term){const url='https://musicbrainz.org/ws/2/recording?fmt=json&limit=25&query='+encodeURIComponent(term);const res=await fetchTimeout(url);if(!res.ok)throw new Error('mb');const data=await res.json();return {results:(data.recordings||[]).map(r=>({trackName:r.title,artistName:(r['artist-credit']||[]).map(a=>a.name).join(', '),artworkUrl100:''}))}}
+async function handleSearch(term){
+  S.searching=true;S.searchResults=null;renderSearchResults();
+  let data=null;
+  const methods=[['iTunes',searchiTunesJSONP],['AllOrigins',searchAllOrigins],['CorsProxy',searchCorsProxy],['MusicBrainz',searchMusicBrainz]];
+  for(const [name,fn] of methods){try{data=await fn(term);console.log('✓ Búsqueda OK con:',name);break}catch(e){console.warn('✗',name,'falló:',e.message)}}
+  if(!data){S.searchResults=[];S.searching=false;renderSearchResults();toast('Sin conexión. Pega un enlace o añade manual.','error');return}
+  const raw=Array.isArray(data)?data:(data.results||[]);
+  const seen=new Set();
+  S.searchResults=raw.filter(r=>r.trackName&&r.artistName).map(r=>({title:String(r.trackName).slice(0,120),artist:String(r.artistName).slice(0,120),artwork:(r.artworkUrl100||'').replace('100x100','400x400'),platform:'Apple Music'})).filter(r=>{const k=norm(r.title)+'|'+norm(r.artist);if(seen.has(k))return false;seen.add(k);return true});
+  if(!S.searchResults.length)toast('Sin resultados. Prueba otra palabra.','error');
+  S.searching=false;renderSearchResults();
+}
+
+/* ACCIONES */
+async function handleLogin(form){const fd=new FormData(form);const email=(fd.get('email')||'').trim();const pw=fd.get('password')||'';if(!email||!pw)return;const btn=form.querySelector('button[type="submit"]');const orig=btn.textContent;btn.disabled=true;btn.textContent='Entrando…';S.loginError='';try{await auth.signInWithEmailAndPassword(email,pw)}catch(err){const msgs={'auth/user-not-found':'Email no registrado','auth/wrong-password':'Contraseña incorrecta','auth/invalid-email':'Email inválido','auth/invalid-credential':'Email o contraseña incorrectos','auth/too-many-requests':'Demasiados intentos.'};S.loginError=msgs[err.code]||('Error: '+err.message);render()}finally{btn.disabled=false;btn.textContent=orig}}
+async function handleCreateEvent(form){
+  const fd=new FormData(form);
+  const name=(fd.get('name')||'').trim();const place=(fd.get('place')||'').trim();
+  const djName=(fd.get('djName')||'').trim();const pin=(fd.get('pin')||'').trim();
+  const cover=(fd.get('cover')||'').trim();
+  if(!name)return;
+  const btn=form.querySelector('button[type="submit"]');const orig=btn.textContent;
+  btn.disabled=true;btn.textContent='Creando…';
+  try{const id=await createEvent({name,place,djName,pin,cover,date:new Date().toISOString().slice(0,10),createdAt:Date.now()});addMyEvent(id,name);if(pin)sessionStorage.setItem('qr_unlock_'+id,'1');navigate('#/dj/'+id)}
+  catch(err){toast('Error: '+err.message,'error');btn.disabled=false;btn.textContent=orig}
+}
+async function handleDeleteEvent(id,name){
+  if(!confirm('¿Borrar el evento "'+name+'"?\n\nSe eliminarán TODAS las canciones y votos. No se puede deshacer.')) return;
+  try{
+    await deleteEventDB(id);
+    removeMyEvent(id);
+    toast('Evento borrado ✓');
+    if(S.eventId===id) navigate('#/dj');
+    else render();
+  }catch(err){toast('Error: '+err.message,'error')}
+}
+async function handleShare(url,name){
+  if(navigator.share){
+    try{await navigator.share({title:'QUErico — '+name,text:'Pide tu música en '+name,url})}catch(e){}
+  }else{
+    await navigator.clipboard.writeText(url);
+    toast('Enlace copiado ✓');
+  }
+}
+async function addOrVoteSong(song){
+  const k=norm(song.title)+'|'+norm(song.artist);
+  const ex=songsArray(S.event).find(s=>['pending','approved','playing'].includes(s.status)&&norm(s.title)+'|'+norm(s.artist)===k);
+  if(ex){await voteSong(S.eventId,ex.id,1);toast('Ya estaba pedida. ¡Voto sumado! 👍');return 'voted'}
+  await addSong(S.eventId,song);registerUserRequest(S.eventId);return 'added';
+}
+async function handleManualAdd(form){
+  const fd=new FormData(form);const title=(fd.get('title')||'').trim();const artist=(fd.get('artist')||'').trim();
+  if(!title)return;
+  if(!canUserRequest(S.eventId)){toast('Ya usaste tus 3 peticiones de hoy','error');return}
+  try{await addOrVoteSong({title,artist,platform:'Manual'});form.reset();updateDynamic();toast('¡Enviada! 🎵')}catch(err){toast('Error: '+err.message,'error')}
+}
+async function handlePasteLink(form){
+  const fd=new FormData(form);const url=(fd.get('url')||'').trim();
+  if(!url)return;
+  if(!canUserRequest(S.eventId)){toast('Ya usaste tus 3 peticiones de hoy','error');return}
+  let title='',artist='',artwork='';
+  try{const res=await fetchTimeout('https://noembed.com/embed?url='+encodeURIComponent(url),6000);if(res.ok){const d=await res.json();if(d&&!d.error&&d.title){title=d.title;artist=d.author_name||'';artwork=d.thumbnail_url||''}}}catch(e){console.warn(e)}
+  if(!title){try{const u=new URL(url);if(/youtube|youtu\.be/.test(u.hostname))title='Vídeo de YouTube';else if(/spotify/.test(u.hostname)){const m=u.pathname.match(/\/(track|album)\/([^\/]+)/);title=m?decodeURIComponent(m[2]).replace(/[-_]/g,' '):'Canción de Spotify'}else if(/music\.apple/.test(u.hostname)){const m=u.pathname.match(/\/song\/([^\/]+)/);title=m?decodeURIComponent(m[1]).replace(/-/g,' '):'Canción de Apple Music'}else if(/tidal/.test(u.hostname))title='Canción de Tidal';else if(/deezer/.test(u.hostname))title='Canción de Deezer';else title='Canción'}catch(e){title='Canción'}}
+  try{await addOrVoteSong({title,artist,artwork,platform:'Enlace',link:url});form.reset();updateDynamic();toast('¡Añadida! 🎵')}catch(err){toast('Error: '+err.message,'error')}
+}
+function handleJoin(form){const c=extractCode(new FormData(form).get('code'));if(c)navigate('#/e/'+c)}
+function handleOpen(form){const c=extractCode(new FormData(form).get('code'));if(c)navigate('#/dj/'+c)}
+function handleUnlock(form){const pin=(new FormData(form).get('pin')||'').trim();if(pin===String(S.event.pin)){S.unlocked=true;sessionStorage.setItem('qr_unlock_'+S.eventId,'1');S.pinError=false;render()}else{S.pinError=true;render()}}
+const approveSong=id=>updateSong(S.eventId,id,{status:'approved'});
+const rejectSong=id=>updateSong(S.eventId,id,{status:'rejected'});
+async function playSong(id){const cur=songsArray(S.event).find(s=>s.status==='playing');const ops=[];if(cur&&cur.id!==id)ops.push(updateSong(S.eventId,cur.id,{status:'played',playedAt:Date.now()}));ops.push(updateSong(S.eventId,id,{status:'playing'}));await Promise.all(ops)}
+async function replaySong(id){const cur=songsArray(S.event).find(s=>s.status==='playing');const ops=[];if(cur&&cur.id!==id)ops.push(updateSong(S.eventId,cur.id,{status:'played',playedAt:Date.now()}));ops.push(updateSong(S.eventId,id,{status:'playing',playedAt:Date.now()}));await Promise.all(ops)}
+async function stopSong(id){await updateSong(S.eventId,id,{status:'played',playedAt:Date.now()})}
+async function delSong(id){if(!confirm('¿Eliminar esta canción?'))return;await deleteSong(S.eventId,id)}
+async function castVote(id,direction){
+  const prev=S.myVotes[id];if(prev===direction){toast(direction===1?'Ya votaste 👍':'Ya votaste 👎');return}
+  let delta=direction;if(prev===1&&direction===-1)delta=-2;if(prev===-1&&direction===1)delta=+2;
+  S.myVotes[id]=direction;saveVotes(S.eventId,S.myVotes);updateDynamic();
+  try{await voteSong(S.eventId,id,delta)}catch(err){if(prev===undefined)delete S.myVotes[id];else S.myVotes[id]=prev;saveVotes(S.eventId,S.myVotes);updateDynamic();toast('No se pudo votar','error')}
+}
+async function requestSong(title,artist,artwork){
+  const ex=songsArray(S.event).find(s=>['pending','approved','playing'].includes(s.status)&&norm(s.title)+'|'+norm(s.artist)===norm(title)+'|'+norm(artist));
+  if(ex){try{await addOrVoteSong({title,artist,artwork});updateDynamic()}catch(err){toast('Error: '+err.message,'error')}return}
+  if(!canUserRequest(S.eventId)){toast('Ya usaste tus 3 peticiones de hoy','error');return}
+  try{await addOrVoteSong({title,artist,artwork,platform:'Búsqueda'});updateDynamic();toast('¡Enviada! 🎵')}catch(err){toast('Error: '+err.message,'error')}
+}
+async function editBpm(id,title){const s=songsArray(S.event).find(x=>x.id===id);if(!s)return;const val=prompt('BPM de "'+title+'":',s.bpm||'');if(val===null)return;const bpm=parseInt(val,10);await updateSong(S.eventId,id,{bpm:isNaN(bpm)?null:bpm})}
+
+/* EVENTOS CLICK */
+document.addEventListener('click',ev=>{
+  const btn=ev.target.closest('[data-act]');if(!btn)return;
+  const act=btn.dataset.act;
+  if(act==='nav'){ev.preventDefault();navigate(btn.dataset.to);return}
+  if(act==='copy'){navigator.clipboard.writeText(btn.dataset.url).then(()=>toast('Enlace copiado ✓')).catch(()=>toast('Error','error'));return}
+  if(act==='share'){handleShare(btn.dataset.url,btn.dataset.name);return}
+  if(act==='logout'){auth.signOut().then(()=>{toast('Sesión cerrada');navigate('#/')});return}
+  if(act==='approve')approveSong(btn.dataset.id);
+  if(act==='reject')rejectSong(btn.dataset.id);
+  if(act==='play')playSong(btn.dataset.id);
+  if(act==='replay')replaySong(btn.dataset.id);
+  if(act==='stop')stopSong(btn.dataset.id);
+  if(act==='delete')delSong(btn.dataset.id);
+  if(act==='delete-event')handleDeleteEvent(btn.dataset.id,btn.dataset.name);
+  if(act==='upvote')castVote(btn.dataset.id,1);
+  if(act==='downvote')castVote(btn.dataset.id,-1);
+  if(act==='request')requestSong(btn.dataset.title,btn.dataset.artist,btn.dataset.artwork);
+  if(act==='bpm')editBpm(btn.dataset.id,btn.dataset.title);
+});
+document.addEventListener('submit',async ev=>{
+  const form=ev.target.closest('[data-form]');if(!form)return;
+  ev.preventDefault();
+  const t=form.dataset.form;
+  try{
+    if(t==='login')return handleLogin(form);
+    if(t==='create-event')return handleCreateEvent(form);
+    if(t==='open')return handleOpen(form);
+    if(t==='join')return handleJoin(form);
+    if(t==='unlock')return handleUnlock(form);
+    if(t==='paste')return handlePasteLink(form);
+    if(t==='manual')return handleManualAdd(form);
+    if(t==='search'){const q=new FormData(form).get('q').trim();if(q)handleSearch(q)}
+  }catch(err){toast('Error: '+err.message,'error')}
+});
+window.addEventListener('hashchange',route);
+
+/* ARRANQUE */
+if(auth){auth.onAuthStateChanged(user=>{currentUser=user;S.authReady=true;route()})}else{S.authReady=true;route()}
+setTimeout(()=>{document.getElementById('loader')?.classList.add('hide')},1200);
+setTimeout(()=>{document.getElementById('loader')?.remove()},2000);
+</script>
+</body>
+</html>
